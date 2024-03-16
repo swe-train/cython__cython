@@ -1240,6 +1240,7 @@ static int __Pyx_init_co_variables(void) {
 #endif
 
 /////////////// IncludeStructmemberH.proto ///////////////
+//@proto_block: utility_code_proto_before_types
 
 #include <structmember.h>
 
