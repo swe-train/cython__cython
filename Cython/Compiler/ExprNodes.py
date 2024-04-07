@@ -30,7 +30,7 @@ from . import Naming
 from . import Nodes
 from .Nodes import Node, SingleAssignmentNode
 from . import PyrexTypes
-from .PyrexTypes import py_object_type, typecast, error_type, \
+from .PyrexTypes import c_char_ptr_type, py_object_type, typecast, error_type, \
     unspecified_type
 from . import TypeSlots
 from .Builtin import (
@@ -6511,7 +6511,8 @@ class SimpleCallNode(CallNode):
                             PyrexTypes.write_noexcept_performance_hint(
                                 self.pos, code.funcstate.scope,
                                 function_name=perf_hint_entry.name if perf_hint_entry else None,
-                                void_return=self.type.is_void, is_call=True)
+                                void_return=self.type.is_void, is_call=True,
+                                is_from_pxd=(perf_hint_entry and perf_hint_entry.defined_in_pxd))
                         code.globalstate.use_utility_code(
                             UtilityCode.load_cached("ErrOccurredWithGIL", "Exceptions.c"))
                         exc_checks.append("__Pyx_ErrOccurredWithGIL()")
@@ -9901,8 +9902,7 @@ class PyCFunctionNode(ExprNode, ModuleNameMixin):
     binding = False
     def_node = None
     defaults = None
-    defaults_struct = None
-    defaults_pyobjects = 0
+    defaults_entry = None
     defaults_tuple = None
     defaults_kwdict = None
     annotations_dict = None
@@ -9979,33 +9979,32 @@ class PyCFunctionNode(ExprNode, ModuleNameMixin):
 
         if nonliteral_objects or nonliteral_other:
             module_scope = env.global_scope()
-            cname = module_scope.next_id(Naming.defaults_struct_prefix)
-            scope = Symtab.StructOrUnionScope(cname)
-            self.defaults = []
+            types = []
             for arg in nonliteral_objects:
                 type_ = arg.type
                 if type_.is_buffer:
                     type_ = type_.base
-                entry = scope.declare_var(arg.name, type_, None,
-                                          Naming.arg_prefix + arg.name,
-                                          allow_pyobject=True)
+                types.append(type_)
+            types += [ arg.type for arg in nonliteral_other ]
+            self.defaults_entry = module_scope.declare_defaults_c_class(self.pos, types)
+            defaults_class_scope = self.defaults_entry.type.scope
+
+            # sort by name
+            arg_entries = sorted(list(defaults_class_scope.entries.items()))
+            arg_entries = [ e for name, e in arg_entries if name.startswith("arg") ]
+            self.defaults = []
+            for arg, entry in zip(nonliteral_objects + nonliteral_other, arg_entries):
+                arg.defaults_class_key = entry.cname
                 self.defaults.append((arg, entry))
-            for arg in nonliteral_other:
-                entry = scope.declare_var(arg.name, arg.type, None,
-                                          Naming.arg_prefix + arg.name,
-                                          allow_pyobject=False, allow_memoryview=True)
-                self.defaults.append((arg, entry))
-            entry = module_scope.declare_struct_or_union(
-                None, 'struct', scope, 1, None, cname=cname)
-            self.defaults_struct = scope
+
             self.defaults_pyobjects = len(nonliteral_objects)
             for arg, entry in self.defaults:
                 arg.default_value = '%s->%s' % (
                     Naming.dynamic_args_cname, entry.cname)
-            self.def_node.defaults_struct = self.defaults_struct.name
+            self.def_node.defaults_struct = defaults_class_scope.name
 
         if default_args or default_kwargs:
-            if self.defaults_struct is None:
+            if self.defaults_entry is None:
                 if default_args:
                     defaults_tuple = TupleNode(self.pos, args=[
                         arg.default for arg in default_args])
@@ -10022,12 +10021,12 @@ class PyCFunctionNode(ExprNode, ModuleNameMixin):
                 # Fused dispatch functions do not support (dynamic) default arguments, only the specialisations do.
                 if default_args:
                     defaults_tuple = DefaultsTupleNode(
-                        self.pos, default_args, self.defaults_struct)
+                        self.pos, default_args, self.defaults_entry.type.scope)
                 else:
                     defaults_tuple = NoneNode(self.pos)
                 if default_kwargs:
                     defaults_kwdict = DefaultsKwDictNode(
-                        self.pos, default_kwargs, self.defaults_struct)
+                        self.pos, default_kwargs, self.defaults_entry.type.scope)
                 else:
                     defaults_kwdict = NoneNode(self.pos)
 
@@ -10146,11 +10145,11 @@ class PyCFunctionNode(ExprNode, ModuleNameMixin):
 
         if self.defaults:
             code.putln(
-                'if (!__Pyx_CyFunction_InitDefaults(%s, sizeof(%s), %d)) %s' % (
-                    self.result(), self.defaults_struct.name,
-                    self.defaults_pyobjects, code.error_goto(self.pos)))
-            defaults = '__Pyx_CyFunction_Defaults(%s, %s)' % (
-                self.defaults_struct.name, self.result())
+                'if (!__Pyx_CyFunction_InitDefaults(%s, %s)) %s' % (
+                    self.result(), self.defaults_entry.type.typeptr_cname,
+                    code.error_goto(self.pos)))
+            defaults = '__Pyx_CyFunction_Defaults(struct %s, %s)' % (
+                self.defaults_entry.type.objstruct_cname, self.result())
             for arg, entry in self.defaults:
                 arg.generate_assignment_code(code, target='%s->%s' % (
                     defaults, entry.cname))
@@ -10244,7 +10243,7 @@ class CodeObjectNode(ExprNode):
         num_posonly_args = func.num_posonly_args  # Py3.8+ only
         kwonly_argcount = func.num_kwonly_args
         nlocals = len(self.varnames)
-        flags = '|'.join(flags) or '0'
+        flags = '(unsigned int)(%s)' % '|'.join(flags) or '0'
         first_lineno = self.pos[1]
 
         # See "generate_codeobject_constants()" in Code.py.
@@ -10326,9 +10325,9 @@ class DefaultNonLiteralArgNode(ExprNode):
         pass
 
     def result(self):
-        return '__Pyx_CyFunction_Defaults(%s, %s)->%s' % (
+        return '__Pyx_CyFunction_Defaults(struct %s, %s)->%s' % (
             self.defaults_struct.name, Naming.self_cname,
-            self.defaults_struct.lookup(self.arg.name).cname)
+            self.defaults_struct.lookup(self.arg.defaults_class_key).cname)
 
 
 class DefaultsTupleNode(TupleNode):
@@ -11462,6 +11461,7 @@ class CythonArrayNode(ExprNode):
 
         shapes_temp = code.funcstate.allocate_temp(py_object_type, True)
         format_temp = code.funcstate.allocate_temp(py_object_type, True)
+        format_ptr_temp = code.funcstate.allocate_temp(c_char_ptr_type, True)
 
         itemsize = "sizeof(%s)" % dtype.empty_declaration_code()
         type_info = Buffer.get_type_information_cname(code, dtype)
@@ -11489,9 +11489,21 @@ class CythonArrayNode(ExprNode):
         ))
         code.put_gotref(shapes_temp, py_object_type)
 
-        code.putln('%s = __pyx_array_new(%s, %s, PyBytes_AS_STRING(%s), "%s", (char *) %s); %s' % (
+
+        code.putln("#if CYTHON_COMPILING_IN_LIMITED_API")
+        code.putln('%s = PyBytes_AsString(%s); %s' % (
+            format_ptr_temp, format_temp,
+            code.error_goto_if_null(format_ptr_temp, self.pos),
+        ))
+        code.putln("#else")
+        code.putln('%s = PyBytes_AS_STRING(%s);' % (
+            format_ptr_temp, format_temp,
+        ))
+        code.putln("#endif")
+
+        code.putln('%s = __pyx_array_new(%s, %s, %s, "%s", (char *) %s); %s' % (
             self.result(),
-            shapes_temp, itemsize, format_temp, self.mode, self.operand.result(),
+            shapes_temp, itemsize, format_ptr_temp, self.mode, self.operand.result(),
             code.error_goto_if_null(self.result(), self.pos),
         ))
         self.generate_gotref(code)
@@ -11502,6 +11514,7 @@ class CythonArrayNode(ExprNode):
 
         dispose(shapes_temp)
         dispose(format_temp)
+        code.funcstate.release_temp(format_ptr_temp)
 
     @classmethod
     def from_carray(cls, src_node, env):
